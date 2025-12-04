@@ -22,6 +22,9 @@ logger = logging.getLogger(__name__)
 # Maximum job duration: 7 minutes
 MAX_JOB_DURATION = 7 * 60
 
+# Global flag to track if CUDA is broken - prevents repeated failed attempts
+_cuda_broken = False
+
 
 def handler(event: Dict[str, Any]):
     """
@@ -55,6 +58,14 @@ def handler(event: Dict[str, Any]):
         ...
     }
     """
+    global _cuda_broken
+
+    # Fast exit if CUDA already known to be broken - don't waste time retrying
+    if _cuda_broken:
+        logger.error("CUDA already marked as broken - killing worker immediately")
+        yield {"error": "Worker CUDA is broken", "error_type": "NotEnoughGPUResources", "fatal": True}
+        os._exit(1)  # Hard exit - cannot be caught
+
     aggregated_batch_count = 0
     total_computed = 0
     total_valid = 0
@@ -216,17 +227,17 @@ def handler(event: Dict[str, Any]):
         except:
             pass
     except NotEnoughGPUResources as e:
-        # CUDA/GPU initialization failed - kill worker so RunPod restarts it on different machine
+        # CUDA/GPU initialization failed - mark as broken and kill worker
+        _cuda_broken = True
         logger.error(f"GPU INIT FAILED: {str(e)}")
-        logger.error("Terminating worker - RunPod will restart on different machine")
+        logger.error("CUDA broken - killing worker with os._exit(1)")
         yield {
             "error": str(e),
             "error_type": "NotEnoughGPUResources",
             "fatal": True,
         }
-        # Give RunPod time to receive the error before killing
-        time.sleep(1)
-        sys.exit(1)  # Kill worker - RunPod will create new one on different machine
+        # os._exit(1) cannot be caught - forces immediate process termination
+        os._exit(1)
 
     except Exception as e:
         logger.error(f"ERROR: {str(e)}", exc_info=True)
