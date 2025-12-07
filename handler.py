@@ -2,8 +2,9 @@ import os
 import sys
 import time
 import logging
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 
+import requests
 import runpod
 
 # Add src to path
@@ -22,11 +23,149 @@ logger = logging.getLogger(__name__)
 # Maximum job duration: 7 minutes
 MAX_JOB_DURATION = 7 * 60
 
+# Warmup polling interval
+WARMUP_POLL_INTERVAL = 5  # seconds
+WARMUP_MAX_DURATION = 10 * 60  # 10 minutes max warmup time
+
 # Global flag to track if CUDA is broken - prevents repeated failed attempts
 _cuda_broken = False
 
 
-def handler(event: Dict[str, Any]):
+def fetch_warmup_params(callback_url: str, job_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Fetch generation params from MLNode callback URL.
+    Returns params dict if available, None if still waiting.
+    """
+    try:
+        url = f"{callback_url}/warmup/params"
+        response = requests.get(
+            url,
+            params={"job_id": job_id},
+            timeout=10
+        )
+        response.raise_for_status()
+        data = response.json()
+
+        if data.get("status") == "ready":
+            return data.get("params")
+        return None
+
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Failed to fetch warmup params: {e}")
+        return None
+
+
+def send_batch_to_callback(callback_url: str, batch: Dict[str, Any], node_id: int) -> bool:
+    """
+    Send a generated batch to the callback URL.
+    Used in warmup mode where DelegationController is not polling.
+    """
+    try:
+        url = f"{callback_url}/generated"
+        payload = {
+            "public_key": batch.get("public_key", ""),
+            "block_hash": batch.get("block_hash", ""),
+            "block_height": batch.get("block_height", 0),
+            "nonces": batch.get("nonces", []),
+            "dist": batch.get("dist", []),
+            "node_id": node_id,
+        }
+        response = requests.post(url, json=payload, timeout=10)
+        response.raise_for_status()
+        return True
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Failed to send batch to callback: {e}")
+        return False
+
+
+def warmup_handler(event: Dict[str, Any], callback_url: str, job_id: str):
+    """
+    Warmup mode handler - initializes CUDA and waits for params.
+
+    1. Initialize CUDA/PyTorch
+    2. Poll callback_url for generation params
+    3. When params received, run normal generation
+    """
+    import torch
+
+    logger.info(f"WARMUP MODE: job_id={job_id}, callback_url={callback_url}")
+
+    # Initialize CUDA
+    logger.info("Initializing CUDA...")
+    cuda_start = time.time()
+
+    gpu_count = torch.cuda.device_count()
+    if gpu_count == 0:
+        yield {"error": "No GPUs available", "error_type": "NotEnoughGPUResources", "fatal": True}
+        return
+
+    # Warm up each GPU
+    for i in range(gpu_count):
+        torch.cuda.set_device(i)
+        # Small tensor allocation to initialize CUDA context
+        _ = torch.zeros(1, device=f"cuda:{i}")
+
+    logger.info(f"CUDA initialized in {time.time() - cuda_start:.1f}s, {gpu_count} GPUs available")
+
+    yield {
+        "status": "warmup_ready",
+        "cuda_initialized": True,
+        "gpu_count": gpu_count,
+        "job_id": job_id,
+    }
+
+    # Poll for params
+    warmup_start = time.time()
+    poll_count = 0
+
+    while True:
+        elapsed = time.time() - warmup_start
+
+        # Check warmup timeout
+        if elapsed > WARMUP_MAX_DURATION:
+            logger.info(f"WARMUP TIMEOUT: {elapsed:.0f}s exceeded {WARMUP_MAX_DURATION}s limit")
+            yield {"status": "warmup_timeout", "elapsed": int(elapsed)}
+            return
+
+        poll_count += 1
+        logger.info(f"Warmup poll #{poll_count}: checking for params...")
+
+        params = fetch_warmup_params(callback_url, job_id)
+
+        if params:
+            logger.info(f"Warmup got params after {elapsed:.0f}s, starting generation")
+            yield {"status": "warmup_params_received", "elapsed": int(elapsed)}
+
+            # Get callback URL for results from params
+            results_callback_url = params.get("callback_url", "")
+            node_id = params.get("node_id", 0)
+
+            # Create event with received params and run generation with HTTP callback
+            generation_event = {"input": params}
+            yield from generation_handler(
+                generation_event,
+                send_to_callback=True,
+                callback_url=results_callback_url,
+                node_id=node_id,
+            )
+            return
+
+        # Yield heartbeat
+        yield {
+            "status": "warmup_waiting",
+            "poll_count": poll_count,
+            "elapsed": int(elapsed),
+        }
+
+        time.sleep(WARMUP_POLL_INTERVAL)
+
+
+def generation_handler(
+    event: Dict[str, Any],
+    send_to_callback: bool = False,
+    callback_url: str = "",
+    node_id: int = 0,
+):
     """
     Parallel streaming nonce generator using multiple GPU groups.
 
@@ -47,6 +186,12 @@ def handler(event: Dict[str, Any]):
         "start_nonce": int,
         "params": dict,
     }
+
+    Args:
+        event: Runpod event with input data
+        send_to_callback: If True, send results via HTTP to callback_url
+        callback_url: URL to send results to (used in warmup mode)
+        node_id: Node ID to include in batches sent to callback
 
     Yields:
     {
@@ -202,6 +347,10 @@ def handler(event: Dict[str, Any]):
                 # (delegation_controller deduplicates by batch_number)
                 result["batch_number"] = aggregated_batch_count
 
+                # Send to callback URL if in warmup mode
+                if send_to_callback and callback_url:
+                    send_batch_to_callback(callback_url, result, node_id)
+
                 logger.info(f"Batch #{aggregated_batch_count} from worker {result['worker_id']}: "
                            f"{result.get('batch_valid', 0)} valid, elapsed={int(elapsed)}s")
 
@@ -254,6 +403,39 @@ def handler(event: Dict[str, Any]):
             torch.cuda.empty_cache()
         except:
             pass
+
+
+def handler(event: Dict[str, Any]):
+    """
+    Main handler - dispatches to warmup or generation mode.
+
+    Warmup mode input:
+    {
+        "warmup_mode": True,
+        "callback_url": "http://mlnode:9090"
+    }
+
+    Generation mode input (normal):
+    {
+        "block_hash": str,
+        "block_height": int,
+        ...
+    }
+    """
+    input_data = event.get("input", {})
+    warmup_mode = input_data.get("warmup_mode", False)
+
+    if warmup_mode:
+        callback_url = input_data.get("callback_url", "")
+        job_id = event.get("id", "unknown")
+
+        if not callback_url:
+            yield {"error": "callback_url is required for warmup mode", "error_type": "ValueError"}
+            return
+
+        yield from warmup_handler(event, callback_url, job_id)
+    else:
+        yield from generation_handler(event)
 
 
 # Start serverless handler with streaming support
